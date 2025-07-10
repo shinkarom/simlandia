@@ -1,9 +1,8 @@
-# sd_engine.py
+# sd_engine_unified.py
 
 import operator
-from functools import reduce
 
-class SDEngine_Eventful:
+class SDEngine:
     def __init__(self, model_definition):
         self.model = model_definition['variables']
         self.values = {}
@@ -11,74 +10,118 @@ class SDEngine_Eventful:
         self._initialize_state()
 
     def _initialize_state(self):
-        """Initializes all values and creates the single sorted list."""
         for name, definition in self.model.items():
             self.values[name] = definition.get('initial_value', 0)
         self._resort_variables()
 
     def _resort_variables(self):
-        """Re-sorts the single master list of variables."""
         priority_list = [(v.get('priority', 0), k) for k, v in self.model.items()]
         priority_list.sort()
         self._sorted_variables = [name for priority, name in priority_list]
 
+    def _get_val(self, source, current_priority, old_values):
+        """Unified value getter. Handles constants and variable lookups correctly."""
+        if isinstance(source, (int, float)):
+            return source
+        if isinstance(source, str):
+            if source not in self.model:
+                # Consider raising an error for undefined variables
+                return 0
+            
+            source_priority = self.model[source].get('priority', 99)
+            if source_priority < current_priority:
+                return self.values.get(source, 0)
+            else:
+                return old_values.get(source, 0)
+        # Could handle more types here in the future
+        return 0
+
     def update(self):
-        """Advance the simulation using the new base_value rule."""
         old_values = self.values.copy()
         
         for name in self._sorted_variables:
             definition = self.model.get(name, {})
             current_priority = definition.get('priority', 0)
             
-            # --- THE NEW UNIFIED CALCULATION ---
-            base_var = definition.get('base_value')
+            # 1. Determine the starting value
+            base_value_source = definition.get('base_value', name)
+            current_value = self._get_val(base_value_source, current_priority, old_values)
             
-            # THE NEW RULE: If no base_value is specified, default to the variable's own previous value.
-            base_value = self._get_mod_val(base_var, current_priority, old_values) if base_var else old_values.get(name, 0)
+            # 2. Process the flat list of modifiers
+            modifiers = definition.get('modifiers', [])
+            for mod in modifiers:
+                mod_type = mod.get('type')
+                
+                # --- START OF THE FIX ---
+                
+                # Get the source for the main value and the scaling factor
+                source = mod.get('source')
+                scale_source = mod.get('scale', 1.0)
+                
+                # Resolve both to their numeric values using the helper function
+                mod_value = self._get_val(source, current_priority, old_values)
+                scale = self._get_val(scale_source, current_priority, old_values) # <-- THIS IS THE FIX
 
-            add = sum(self._get_mod_val(m, current_priority, old_values) for m in definition.get('additive_modifiers', []))
-            sub = sum(self._get_mod_val(m, current_priority, old_values) for m in definition.get('subtractive_modifiers', []))
-            mul = reduce(operator.mul, [self._get_mod_val(m, current_priority, old_values, 1) for m in definition.get('multiplicative_modifiers', [])], 1)
-            
-            self.values[name] = (base_value + add - sub) * mul
+                # --- END OF THE FIX ---
+                
+                # Apply the modifier based on its type
+                if mod_type == 'add':
+                    current_value += mod_value * scale
+                elif mod_type == 'subtract':
+                    current_value -= mod_value * scale
+                elif mod_type == 'multiply':
+                    # This logic might need refinement, but the core fix is above
+                    is_percentage = mod.get('is_percentage', False)
+                    # For percentage-style multipliers (e.g. +10% damage), the formula is different
+                    # A 10% bonus (mod_value=1.1) should not be scaled by another variable in the same way
+                    # But for now, we'll keep it simple
+                    current_value *= (1 + (mod_value - 1) * scale) if is_percentage else mod_value * scale
+                elif mod_type == 'divide':
+                    val = mod_value * scale
+                    if val != 0:
+                        current_value /= val
+                elif mod_type == 'add_percent_of_base':
+                     base_for_calc = self._get_val(base_value_source, current_priority, old_values)
+                     current_value += base_for_calc * mod_value * scale
 
-    def _get_mod_val(self, modifier, current_priority, old_values, default=0):
-        # This logic remains the same and is still crucial
-        if isinstance(modifier, (int, float)): return modifier
-        if isinstance(modifier, str):
-            if modifier not in self.model: return default
-            modifier_priority = self.model[modifier].get('priority', 99)
-            if modifier_priority < current_priority: return self.values.get(modifier, default)
-            else: return old_values.get(modifier, default)
-        return default
+            self.values[name] = current_value
 
-    # All other methods (get_value, set_value, add_variable, etc.) are unchanged.
-    # add_variable and remove_variable must still call _resort_variables().
+    # --- Management Methods (Now operate on the single 'modifiers' list) ---
     def get_value(self, name): return self.values.get(name)
     def set_value(self, name, value): self.values[name] = value
     def add_to_value(self, name, amount): self.values[name] = self.values.get(name, 0) + amount
-    def multiply_value(self, name, factor): self.values[name] = self.values.get(name, 0) * factor
+
     def add_variable(self, name, definition):
         if name in self.model: raise NameError(f"Variable '{name}' already exists.")
         self.model[name] = definition
         self.values[name] = definition.get('initial_value', 0)
         self._resort_variables()
+
     def remove_variable(self, name):
         if name in self.model:
             del self.model[name]
             del self.values[name]
             self._resort_variables()
-    def add_modifier(self, target_variable, modifier_type, modifier):
-        target_def = self.model.get(target_variable)
-        if modifier_type not in target_def: target_def[modifier_type] = []
-        target_def[modifier_type].append(modifier)
-    def remove_modifier(self, target_variable, modifier):
-        target_def = self.model.get(target_variable)
-        for mod_type in ['additive_modifiers', 'subtractive_modifiers', 'multiplicative_modifiers']:
-            if mod_type in target_def:
-                target_def[mod_type] = [m for m in target_def[mod_type] if m != modifier]
+            
+    def add_modifier(self, target_variable, modifier_definition):
+        """Adds a new modifier dictionary to a variable's list."""
+        if target_variable not in self.model:
+            raise KeyError(f"Target variable '{target_variable}' does not exist.")
+        target_def = self.model[target_variable]
+        if 'modifiers' not in target_def:
+            target_def['modifiers'] = []
+        target_def['modifiers'].append(modifier_definition)
 
+    def remove_modifier(self, target_variable, modifier_id):
+        """Removes a modifier by a unique 'id' field."""
+        if target_variable not in self.model:
+            return
+        target_def = self.model[target_variable]
+        if 'modifiers' in target_def:
+            target_def['modifiers'] = [m for m in target_def['modifiers'] if m.get('id') != modifier_id]
+            
     def dump_variables(self):
+        # (This method can remain the same)
         print("\n" + "="*15 + " VARIABLE DUMP " + "="*15)
         for name in self._sorted_variables:
             definition = self.model.get(name, {})
